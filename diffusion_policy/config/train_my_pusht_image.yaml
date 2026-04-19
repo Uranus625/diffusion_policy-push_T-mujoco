@@ -1,0 +1,160 @@
+defaults:
+  - _self_  # 告诉Hydra不要加载外部的默认配置目录，只依赖当前文件及其显式声明
+
+name: train_diffusion_unet_hybrid  # 整体训练流程的命名标识
+_target_: diffusion_policy.workspace.train_diffusion_unet_hybrid_workspace.TrainDiffusionUnetHybridWorkspace  # 指向训练工作空间类的路径，负责把各模块串起来并执行训练
+
+task_name: my_pusht_image  # 当前任务名称
+shape_meta: &shape_meta    # 定义“形状元数据”（数据的结构），使用 &shape_meta 锚点方便下面重复引用
+  obs:                     # 网络观测输入（眼睛）
+    front_image:
+      shape: [3, 96, 96]   # 全局图像（通道数，高，宽）
+      type: rgb            # 数据类型为彩色图像
+    wrist_image:
+      shape: [3, 96, 96]   # 手腕图像
+      type: rgb
+    robot_eef_pose:
+      shape: [2]           # 机器人的末端2D坐标 (X, Y)
+      type: low_dim        # 低维特征向量数据
+  action:                  # 网络的输出预测结果（手）
+    shape: [2]             # 机器人需要移动到的目标2D坐标 (X, Y)
+
+task:
+  name: my_pusht_image
+  shape_meta: *shape_meta  # *shape_meta 引用上面定好的锚点输入输出格式
+  env_runner:              # 在训练过程中，用于自动化评估/测试环境运行的设置
+    _target_: diffusion_policy.env_runner.pusht_image_runner.PushTImageRunner
+    n_train: 0             # 训练中途开启的训练集仿真评估次数 (设为0表示不跑以节约时间)
+    n_train_vis: 0         # 训练集仿真录像次数
+    n_test: 0              # 训练中途开启的测试集仿真评估次数 (没有仿真环境也可设0)
+    n_test_vis: 0          # 测试集仿真录像次数
+    test_start_seed: 100000 # 测试环境的随机数种子起点
+    max_steps: 300         # 每次评估在评估仿真里最多跑多少步
+    n_obs_steps: ${n_obs_steps}       # 引用下文的连续观测步数
+    n_action_steps: ${n_action_steps} # 引用下文的连续动作动作步数
+    fps: 10                # 环境评估的动作执行帧率
+    past_action: False     # 是否把过去的动作叠加作为状态送给策略
+    n_envs: null           # 并行运行的环境数，null表示默认不开启多进程验证
+    legacy_test: True      # 使用旧版的测试协议运行
+  dataset:                 # 数据集加载器提取配置
+    _target_: diffusion_policy.dataset.my_pusht_dataset.MyPushtDataset # 自定义数据读取脚本类
+    zarr_path: data/       # 你的重放缓冲区(存放轨迹的)根目录文件夹
+    horizon: ${horizon}    # 每一个数据块的大窗口总时间跨度 (比如 16)
+    pad_before: 1          # 序列在最开头第0步之前的补齐步数（解决起始动作读不到前置画面的问题）
+    pad_after: 7           # 序列在最后一帧打完后的补齐步数（解决末尾动作不足问题）
+    seed: 42               # 随机数种子（用于验证集切割等，保证可复现）
+    val_ratio: 0.02        # 取出多少比例的视频轨迹拿去偷偷做验证集检验Loss，0.02表示2%
+    max_train_episodes: 90 # 最多吸收的训练序列数量（只取前90条，剩余丢弃）
+
+exp_name: "default"        # 实验代号名称
+horizon: 16                # 【核心参数】滚动控制时域总长度：观察帧 + 预测未来行为之和的总框
+n_obs_steps: 2             # 【核心参数】策略每次需要看“过去+现在”连续 2 帧的图像做输入
+n_action_steps: 8          # 【核心参数】策略每次会输出它认为绝对自信的、未来连续执行的 8 帧动作
+n_latency_steps: 0         # 系统指令网络输出执行的强制滞后步数，0 表示顺滑触发
+
+dataset_obs_steps: ${n_obs_steps}  # 数据集中截取的观测步长，等于网络实际需求步长
+past_action_visible: False      # 是否带入历史动作到去噪过程中
+keypoint_visible_rate: 1.0      # (特定环境特有) 关键点可见率
+obs_as_global_cond: True        # ★核心机制：是否把图像观测编码后作为 扩散模型(UNet)的全局条件进行条件去噪
+
+policy:
+  _target_: diffusion_policy.policy.diffusion_unet_hybrid_image_policy.DiffusionUnetHybridImagePolicy # 1D CNN混合型扩散策略模型
+
+  shape_meta: *shape_meta
+  
+  noise_scheduler:           # 扩散模型加噪/去噪的核心排期表 (DDPM)
+    _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
+    num_train_timesteps: 100 # SD画图需要1000步去噪，机械臂控制较简单，压缩到 100 步加速极多
+    beta_start: 0.0001       # 第一步加噪的基础噪音能量
+    beta_end: 0.02           # 最后一步加噪的最大噪音能量
+    beta_schedule: squaredcos_cap_v2 # 噪音增大衰减曲线的形式（余弦比线性好，更好地抑制突变）
+    variance_type: fixed_small       # DDPN模型方差估计选取
+    clip_sample: True                # 是否在降噪抽样途中把值截断保护在[-1, 1]附近防止数据飞到火星
+    prediction_type: epsilon         # 模型底层去预测的目标是什么（epsilon 意味着网络核心直接去估算那个无意义的“高斯噪音”）
+
+  obs_encoder_group_norm: True # 先使用 Group Norm 对图像编码器(ResNet)的输出再走进一步规整，促使收敛
+  eval_fixed_crop: True        # 在评估、验证时，保持固定中心裁剪画面而不是随机跳变
+  crop_shape: [84, 84]         # 数据增强核心：从原尺寸(96x96)随机/固定裁出 84x84 的区域交进去防镜头抖动带来的过拟合
+
+  obs_as_global_cond: ${obs_as_global_cond} # 将图像送给CrossAttention还是像文字Prompt一样融合，True=文字Prompt式全局调节
+
+  horizon: ${horizon}
+  n_action_steps: ${n_action_steps}
+  n_obs_steps: ${n_obs_steps}
+  
+  num_inference_steps: 100     # 最终真实去去预测时的循环迭代步数 
+
+  diffusion_step_embed_dim: 128 # 扩散步骤（时间标签T）本身的升维特征厚度
+  down_dims: [512, 1024, 2048]  # 去噪 U-Net 向下三层采样的每一层信道厚度配置
+  kernel_size: 5                # U-Net内的“时间序列维度”上的1维一维卷积核宽度，5代表抓取连贯5步动作的规律
+  n_groups: 8                   # CNN 层内置 Group Norm 划成对组数
+  cond_predict_scale: True      # True 为带有调整去噪参数大小
+
+ema:  # 指数移动平均 (Exponential Moving Average) : 相当于“老司机记忆”。不仅存最新一轮的权重，还将各轮权重加权混合，抑制网络突发精神病。
+  _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
+  update_after_step: 0       # 多少步之后才拉起EMA进行备份和平滑算起
+  inv_gamma: 1.0             # EMA 内建衰减算法曲线
+  power: 0.75                # EMA 力量衰减系数
+  min_value: 0.0             # EMA 可以抵达下的最低系数
+  max_value: 0.9999          # EMA 极其偏袒旧体权重指数，0.9999即几乎全取历代平滑稳健模型，新一轮只融合 0.01%
+ 
+dataloader: 
+  batch_size: 128 # 批大小（显卡吃不消请降低到64/32，显存够甚至可以拉到256加速）
+  num_workers: 16 # 【注意】你的双视摄像头图片数据预处理会高运算，内存炸掉或爆满时，把它降为 8 甚至 4
+  shuffle: True   # 必须打开洗牌：打破原本录制动作从头到尾被记住的时绪顺序
+  pin_memory: True # 开启锁页内存加速数据送往GPU的专列
+  persistent_workers: False # 跑完一次大Epoch后不要常驻保鲜这批Loader子进程节省显存资源
+
+val_dataloader: # 验证集抽水机
+  batch_size: 128
+  num_workers: 0  # 验证集本来就不大，干脆不开多线程（避免新进程消耗）
+  shuffle: False  # 验证看准不准不用打乱
+  pin_memory: True
+  persistent_workers: False
+
+optimizer:  # 优化器(深度学习“调参指导老师”)
+  _target_: torch.optim.AdamW # 用了能更好防过拟合的 Adam 改进版（带权重衰减）
+  lr: 1.0e-4                  # 第一学习率：控制一次猜错后修正的步伐（0.0001较小但是对于扩散极其科学）
+  betas: [0.95, 0.999]        # Adam 的动量平滑参数 (过去动能占比)
+  eps: 1.0e-8                 # 防计算爆炸极小数
+  weight_decay: 1.0e-6        # 权重衰减（即L2正则），遏制住过于离谱离群的权重
+
+training: # 大主干轮训练安排
+  device: "cuda:0"            # 用这张显卡去训练你数据
+  seed: 42                    # 在代码中给定了42这个玄学密码使得所有随机现象永远固定
+  debug: False                # 设True则会跳过繁琐过程强开测试模式，但没实用
+  resume: True                # 万一终端/断电了，可以自动接着最新的 epoch 断点继续练
+  lr_scheduler: cosine        # “余弦衰减”：让学习步幅刚开始稳定后渐渐像余弦函数那样变小变细腻
+  lr_warmup_steps: 500        # 大暖身：前500步让步伐从0慢慢慢慢爬到1e-4免得它突然爆发变智障报错
+  num_epochs: 400             # 所有的录制数据集整整拿来回炉嚼多少轮？
+  gradient_accumulate_every: 1 # 物理不够，累加来凑。比如你因为显卡渣只能塞Batch 32, 设为 4 就能存 4 组 32 后凑够 128 假装再触发计算下降
+  use_ema: True               # 开启最上面配置好的 EMA 安全老人模式
+  rollout_every: 50           # 每嚼了50轮尝试拉一个仿真的环境自己演练评估 (若测试打不开此项自动略过无效)
+  checkpoint_every: 50        # 每学习 50 轮往 outputs/ 文件夹保存一次 .ckpt 断点快照！
+  val_every: 1                # 每一轮学习完结跑一下那点用来验证偷跑的数据做交叉对比
+  sample_every: 5             # 每5步拉生成样本测试
+  max_train_steps: null       # 不设整体天花板步长上限限制
+  max_val_steps: null         # 同上
+  tqdm_interval_sec: 1.0      # 进度界面栏多久刷新打印一次。
+
+logging:  # 数据图表监控，支持外挂 Weights & Biases (Wandb云监测站)
+  project: diffusion_policy_my_pusht # 云端面板名
+  resume: True                       # 连接接续记录
+  mode: offline                      # 【重点】如果是offline，不向云端发送耗费流量去存；你想手机看训练折线曲线可以改成 online 然后去 wandb.ai 官网免费注册拿到 key 配置。
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name} # 本地记录名字
+  tags: ["${name}", "${task_name}", "${exp_name}"]
+  id: null
+  group: null
+
+checkpoint: # 快照保留法设置
+  topk: # 保留天梯排行最强的模型
+    monitor_key: train_loss # 靠着训练出的最小Loss(误差)来论英雄，因为如果你没有做专门的评估服不能用val_loss
+    mode: min               # 名次：也就是挑选误差“最低”（最小min）
+    k: 5                    # 你的库文件夹里面永远只缓存排名前 5 的模型和最后的文件，以免硬盘被录破产
+    format_str: 'epoch={epoch:04d}-train_loss={train_loss:.3f}.ckpt' # 文件命名规则
+  save_last_ckpt: True      # 【必须设True】确保无论被踢出好成绩没，最后一个临行遗言始终保存着不丢失！
+  save_last_snapshot: False # 完整大内存快照不用存，太浪费
+
+multi_run: # 处理大型串联批量打猎的任务记录预设结构
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
